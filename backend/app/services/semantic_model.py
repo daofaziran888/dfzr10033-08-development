@@ -20,62 +20,65 @@ class SemanticModelService(BaseModuleService):
     NEGATIVE_ACTIONS = []
 
     def validate_and_promote(self, model_id: int) -> dict[str, Any]:
-        """校验语义模型并投产：验证源表映射、字段别名与度量定义。
+        """校验语义模型并投产：投产必须消费逐列契约校验报告。
 
         跨模块数据流：
-        - 读取 source_registry 校验源表是否存在
-        - 读取 query_rewrite 获取可用的改写规则
-        - 写入数据契约作为Schema承诺
+        - 读取 data_contract 的已发布口径版本（含逐列约束）
+        - 生成 contract_check 逐列契约校验报告
+        - 写入 model_promotion 投产记录并生成可查询字段清单
+        - 投产结果回写到契约检查清单与契约本身
         - 写入审计日志
+        """
+        from app.services.model_promotion import ModelPromotionService
+
+        model = store.find(self.MODULE, model_id)
+        if model is None:
+            return {"ok": False, "message": "语义模型不存在"}
+
+        aliases = model.get("字段别名", "")
+        result = ModelPromotionService().promote_with_contract(model_id)
+        if result.get("ok"):
+            result["fields_count"] = len([a for a in aliases.split(",") if a.strip()])
+            _audit_promotion(model_id, model.get("模型编号", ""))
+        return result
+
+    def save_alias_mapping(
+        self,
+        model_id: int,
+        mapping: dict[str, str],
+        *,
+        new_version: str | None = None,
+    ) -> dict[str, Any]:
+        """只保存别名到源列的映射（不投产），供「仅变动别名」的修订使用。
+
+        - 别名能映射到同一源列时按映射关系保存，多个别名可指向同一源列；
+        - 同步刷新字段别名清单与版本序号，模型保持草稿状态等待投产确认。
         """
         model = store.find(self.MODULE, model_id)
         if model is None:
             return {"ok": False, "message": "语义模型不存在"}
 
-        source_ref = model.get("源表映射", "")
-        validation_issues = []
+        clean_mapping = {
+            str(alias).strip(): str(source).strip()
+            for alias, source in mapping.items()
+            if str(alias).strip() and str(source).strip()
+        }
+        if not clean_mapping:
+            return {"ok": False, "message": "别名映射不能为空"}
 
-        # 校验源表是否存在
-        if "source_registry" in source_ref:
-            sources = store.rows("source_registry")
-            related = [s for s in sources if str(s.get("id")) in source_ref]
-            if not related:
-                validation_issues.append("关联的数据源不存在或已停用")
-
-        # 校验字段别名不为空
-        aliases = model.get("字段别名", "")
-        if not aliases.strip() or aliases.strip() == ",":
-            validation_issues.append("字段别名不能为空")
-
-        # 校验度量定义
-        measure = model.get("度量定义", "")
-        if not measure.strip():
-            validation_issues.append("度量定义不能为空")
-
-        if validation_issues:
-            model["status"] = "已废弃"
-            model["abnormal"] = True
-            return {
-                "ok": False,
-                "message": f"校验失败: {'; '.join(validation_issues)}",
-                "issues": validation_issues,
-            }
-
-        # 通过校验，投产模型
-        model["status"] = "已投产"
-        model["pending"] = False
-
-        # 更新数据契约
-        _update_contract_on_promotion(model)
-
-        # 写入审计
-        _audit_promotion(model_id, model.get("模型编号", ""))
-
+        model["源列映射"] = clean_mapping
+        model["字段别名"] = ",".join(clean_mapping.keys())
+        if new_version:
+            model["版本序号"] = new_version
+        model["status"] = "草稿"
+        model["pending"] = True
+        model["abnormal"] = False
         return {
             "ok": True,
             "model_id": model_id,
-            "status": "已投产",
-            "fields_count": len(aliases.split(",")),
+            "版本序号": model.get("版本序号"),
+            "源列映射": clean_mapping,
+            "字段别名": model["字段别名"],
         }
 
     def detect_schema_conflicts(self, source_id: int) -> dict[str, Any]:
@@ -117,14 +120,6 @@ class SemanticModelService(BaseModuleService):
             "conflict_count": len(conflicts),
             "conflicts": conflicts,
         }
-
-
-def _update_contract_on_promotion(model: dict[str, Any]) -> None:
-    contracts = store.rows("data_contract")
-    for c in contracts:
-        if c.get("status") == "草稿" and model.get("模型名称", "") in str(c.get("数据集", "")):
-            c["Schema约束"] = model.get("字段别名", "")
-            c["status"] = "已承诺"
 
 
 def _audit_promotion(model_id: int, model_no: str) -> None:

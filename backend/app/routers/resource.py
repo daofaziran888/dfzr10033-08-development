@@ -7,7 +7,7 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services import service_for
@@ -31,6 +31,10 @@ def list_entries(
     keyword: str | None = Query(default=None), status: str | None = Query(default=None),
     page: int = Query(default=1, ge=1), size: int = Query(default=20, ge=1, le=200),
 ) -> PageResult[dict]:
+    # 固定子路径（如 contract_check/report/...）由文件后部注册的专用路由处理，
+    # 这里只拦截纯模块名的列表请求，避免动态路径抢先匹配。
+    if "/" in module:
+        raise HTTPException(status_code=404, detail=f"未知业务模块：{module}")
     service = require_service(module)
     filters = {k: v.strip() for k, v in request.query_params.items()
                if k in service.LIST_FIELDS and v.strip()}
@@ -96,6 +100,8 @@ from app.services.query_rewrite import QueryRewriteService
 from app.services.query_audit import QueryAuditService
 from app.services.cost_govern import CostGovernService
 from app.services.data_contract import DataContractService
+from app.services.contract_check import ContractCheckService
+from app.services.model_promotion import ModelPromotionService
 from app.services.semantic_model import SemanticModelService
 
 source_svc = SourceRegistryService()
@@ -110,6 +116,8 @@ rewrite_svc = QueryRewriteService()
 audit_svc = QueryAuditService()
 cost_svc = CostGovernService()
 contract_svc = DataContractService()
+contract_check_svc = ContractCheckService()
+promotion_svc = ModelPromotionService()
 
 
 @router.post("/pipelines/source-to-federated")
@@ -221,3 +229,88 @@ def pipeline_cost_aggregate_alert() -> dict[str, Any]:
             "cost_aggregation": cost_svc.aggregate_module_costs(),
             "quota_check": cost_svc.check_monthly_quota(),
             "cache_report": result_cache_svc.cache_hit_rate_report()}
+
+
+# -- 逐列契约校验 / 语义模型投产 --
+
+from pydantic import BaseModel
+
+
+class ContractPublishPayload(BaseModel):
+    列约束: list[dict[str, Any]] | dict[str, Any] | None = None
+    契约阈值: float | None = None
+    关联模型: str | None = None
+
+
+class ColumnCheckPayload(BaseModel):
+    model_id: int
+    version: str | None = None
+
+
+class AliasMappingPayload(BaseModel):
+    mapping: dict[str, str]
+    new_version: str | None = None
+
+
+@router.post("/data_contract/{contract_id}/publish")
+def publish_contract(contract_id: int, payload: ContractPublishPayload) -> dict[str, Any]:
+    """发布契约口径版本，冻结当时的逐列约束定义。"""
+    contract = store.find("data_contract", contract_id)
+    if contract is None:
+        raise HTTPException(status_code=404, detail="数据契约不存在")
+    if payload.列约束 is not None:
+        contract["列约束"] = payload.列约束
+    if payload.契约阈值 is not None:
+        contract["契约阈值"] = payload.契约阈值
+    if payload.关联模型 is not None:
+        contract["关联模型"] = payload.关联模型
+    return contract_svc.publish_contract(contract_id)
+
+
+@router.post("/data_contract/{contract_id}/column-check")
+def run_contract_column_check(contract_id: int, payload: ColumnCheckPayload) -> dict[str, Any]:
+    """按已发布口径版本生成逐列契约校验报告（复查，不投产）。"""
+    result = contract_svc.recheck_published_version(contract_id, payload.model_id, payload.version)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@router.get("/contract_check/report/{report_no}")
+def get_contract_report(report_no: str) -> dict[str, Any]:
+    """按报告编号聚合查看逐列检查项与投产回写结论。"""
+    report = contract_check_svc.get_report(report_no)
+    if report is None:
+        raise HTTPException(status_code=404, detail=f"校验报告{report_no}不存在")
+    return report
+
+
+@router.post("/semantic_model/{model_id}/alias-mapping")
+def save_alias_mapping(model_id: int, payload: AliasMappingPayload) -> dict[str, Any]:
+    """仅保存别名到源列的映射（不投产）。"""
+    result = semantic_svc.save_alias_mapping(
+        model_id, payload.mapping, new_version=payload.new_version
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@router.post("/semantic_model/{model_id}/promote")
+def promote_semantic_model(model_id: int) -> dict[str, Any]:
+    """消费逐列契约校验报告执行投产，并生成可查询字段清单与投产记录。
+
+    阻断（含必填度量缺列、阈值不达标、重复投产）时返回 409，
+    响应体仍带完整的报告编号、阻断原因与可查询清单（空），供前端核对。
+    """
+    result = promotion_svc.promote_with_contract(model_id)
+    if not result.get("ok"):
+        return JSONResponse(status_code=409, content=result)
+    return result
+
+
+@router.get("/model_promotion/by-model/{model_id}")
+def list_model_promotions(model_id: int) -> dict[str, Any]:
+    """从投产记录关联该模型的全部报告与确认结果。"""
+    rows = promotion_svc.list_promotions(model_id)
+    return {"items": rows, "total": len(rows)}

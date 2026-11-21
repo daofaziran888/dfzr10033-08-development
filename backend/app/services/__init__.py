@@ -23,6 +23,8 @@ from app.services.schedule_job import ScheduleJobService
 from app.services.data_lake_read import DataLakeReadService
 from app.services.result_cache import ResultCacheService
 from app.services.data_contract import DataContractService
+from app.services.contract_check import ContractCheckService
+from app.services.model_promotion import ModelPromotionService
 from app.services.ab_config import AbConfigService
 
 SERVICES: dict[str, BaseModuleService] = {
@@ -47,6 +49,8 @@ SERVICES: dict[str, BaseModuleService] = {
     "data_lake_read": DataLakeReadService(),
     "result_cache": ResultCacheService(),
     "data_contract": DataContractService(),
+    "contract_check": ContractCheckService(),
+    "model_promotion": ModelPromotionService(),
     "ab_config": AbConfigService(),
 }
 
